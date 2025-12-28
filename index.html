@@ -55,11 +55,12 @@
   <section class="card">
     <strong>2) コンテンツ選択（3Dモデル）</strong>
     <div class="row" style="margin-top:10px;">
-      <select id="modelSelect" style="flex:1; min-width: 220px;">
+        <select id="modelSelect" style="flex:1; min-width: 220px;">
+        <option value="__EMPTY_ROOM__">空っぽの部屋（格子）</option>
         <option value="assets/models/DamagedHelmet.glb">サンプル：Damaged Helmet（glb）</option>
-        <!-- ここにあなたの .glb を追加していく想定 -->
-        <!-- 例: <option value="assets/models/your_smithsonian_model.glb">Smithsonian: 〜</option> -->
-      </select>
+        <!-- ここにあなたの .glb を追加 -->
+        <option value="assets/models/kalestras_book.glb">サンプル：魔法使いの本（glb）</option>
+        </select>
     </div>
     <div class="hint">
       ・スミソニアンの3Dは 3d.si.edu（Open Access/CC0）や Sketchfab の Smithsonian アカウントから取得できます。 [oai_citation:2‡3D Digitization](https://3d.si.edu/?utm_source=chatgpt.com)

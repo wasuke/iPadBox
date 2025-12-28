@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <title>奥行き錯覚テスト - Viewer</title>
 
-  <!-- three.js（importmap方式） -->
+  <link rel="icon" href="data:,">
+
   <script type="importmap">
   {
     "imports": {
@@ -15,20 +16,16 @@
   }
   </script>
 
-  <!-- MediaPipe Tasks Vision（公式ガイドのCDN例） -->
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.js" crossorigin="anonymous"></script>
-
   <style>
     :root { color-scheme: dark; }
     body { margin:0; overflow:hidden; background:#000; font-family: system-ui, -apple-system, "Hiragino Sans", sans-serif; }
     #wrap { position: fixed; inset: 0; }
     canvas { display:block; width:100%; height:100%; }
 
-    /* 解析用ビデオ（非表示） */
-    #video { position: fixed; right: 8px; bottom: 8px; width: 160px; height: 120px; opacity: .0; pointer-events:none; }
+    /* デバッグ用：必要なら opacity を 0.25 などに上げる */
+    #video { position: fixed; right: 8px; bottom: 8px; width: 160px; height: 120px; opacity: 0; pointer-events:none; }
 
-    /* UI */
-    #hud {
+    #hud{
       position: fixed; left: 12px; top: 12px; right: 12px;
       display:flex; gap:10px; align-items:center; justify-content:space-between;
       background: rgba(0,0,0,.45); border: 1px solid rgba(255,255,255,.14);
@@ -42,11 +39,12 @@
       font-size: 14px; padding: 8px 10px; border-radius: 12px;
       border: 1px solid rgba(255,255,255,.18); background: rgba(20,60,120,.6); color: #fff;
     }
-    #msg {
+
+    #msg{
       position: fixed; left: 12px; bottom: 12px;
       background: rgba(0,0,0,.45); border: 1px solid rgba(255,255,255,.14);
       border-radius: 14px; padding: 10px 12px; color:#e8eef6; font-size: 12px;
-      max-width: min(560px, calc(100vw - 24px));
+      max-width: min(860px, calc(100vw - 24px));
       white-space: pre-wrap;
     }
   </style>
@@ -67,12 +65,20 @@
   </div>
 </div>
 
-<div id="msg">・カメラ許可が必要です
-・顔が映る距離で、左右に首を振ると視点が追従します</div>
+<div id="msg">・最初にフォーカスした顔を追い続けます（完全固定ではないが安定寄り）
+・近づいた分だけズーム（起動時の顔サイズが基準）
+・GLBは中央に小さめで浮いて、ゆっくり回転
+・壁は市松＋明るいパッチ、スポットライト強め（白飛びOK）</div>
 
 <script type="module">
   import * as THREE from "three";
   import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+
+  // MediaPipe Tasks Vision（ESM import）
+  const MP_VER = "0.10.22-rc.20250304";
+  const { FaceLandmarker, FilesetResolver } = await import(
+    `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/vision_bundle.mjs`
+  );
 
   const wrap = document.getElementById("wrap");
   const statusEl = document.getElementById("status");
@@ -85,66 +91,204 @@
   });
 
   const qs = new URLSearchParams(location.search);
-  const camMode = qs.get("camMode") || "front";         // front | back | usb
+  const camMode = qs.get("camMode") || "front";  // front | back | usb
   const deviceId = qs.get("deviceId") || "";
-  const modelUrl = qs.get("model") || "assets/models/DamagedHelmet.glb";
+  const modelParam = qs.get("model") || "__EMPTY_ROOM__";
+  const isEmptyRoom = (modelParam === "__EMPTY_ROOM__");
 
   // -----------------------------
-  // three.js シーン（iPadの中を箱にする）
+  // three.js：レンダラ／シーン／カメラ
   // -----------------------------
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+  // 白飛びOKの方向へ
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.6;
+
   wrap.appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x000000);
+  scene.background = new THREE.Color(0x040508);
 
-  const camera = new THREE.PerspectiveCamera(55, 1, 0.01, 50);
+  const baseFov = 55;
+  const camera = new THREE.PerspectiveCamera(baseFov, 1, 0.01, 50);
 
-  // 箱（内側表示＝BackSide）
-  const boxSize = 2.6;
-  const boxGeo = new THREE.BoxGeometry(boxSize, boxSize, boxSize);
-  const boxMat = new THREE.MeshStandardMaterial({
-    color: 0x0f1722,
-    roughness: 0.95,
-    metalness: 0.0,
-    side: THREE.BackSide
-  });
-  const box = new THREE.Mesh(boxGeo, boxMat);
-  scene.add(box);
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 
-  // ライト
-  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
-  const key = new THREE.DirectionalLight(0xffffff, 1.1);
-  key.position.set(1.5, 2.0, 1.2);
-  scene.add(key);
+  // -----------------------------
+  // 壁テクスチャ：市松＋明るいパッチ
+  // -----------------------------
+  function makeCheckerWithBrightPatches({
+    size = 1024,
+    cells = 12,
+    darkA = "#0f1722",
+    darkB = "#141e2d",
+    bright = "#cfe7ff",
+    bright2 = "#ffffff"
+  } = {}) {
+    const c = document.createElement("canvas");
+    c.width = c.height = size;
+    const g = c.getContext("2d");
 
-  // 中央の基準点
-  const target = new THREE.Vector3(0, 0, 0);
+    const cell = size / cells;
 
-  // モデル読み込み
-  const loader = new GLTFLoader();
-  let modelRoot = null;
+    // 市松
+    for (let y = 0; y < cells; y++) {
+      for (let x = 0; x < cells; x++) {
+        g.fillStyle = ((x + y) % 2 === 0) ? darkA : darkB;
+        g.fillRect(x * cell, y * cell, cell, cell);
+      }
+    }
 
-  async function loadModel(url) {
-    statusEl.textContent = "3Dモデル読み込み中…";
-    const gltf = await loader.loadAsync(url);
-    modelRoot = gltf.scene;
-    // 適当にスケール調整（モデルによって変えてください）
-    modelRoot.scale.setScalar(1.2);
-    modelRoot.position.set(0, -0.55, 0);
-    scene.add(modelRoot);
-    statusEl.textContent = "カメラ起動待ち…";
+    // 明るいパッチ（グローっぽく）
+    const patches = Math.floor(cells * 1.2);
+    for (let i = 0; i < patches; i++) {
+      const px = Math.floor(Math.random() * cells);
+      const py = Math.floor(Math.random() * cells);
+      const w = (1 + Math.floor(Math.random() * 2)) * cell;
+      const h = (1 + Math.floor(Math.random() * 2)) * cell;
+
+      const x0 = px * cell;
+      const y0 = py * cell;
+
+      const grad = g.createRadialGradient(
+        x0 + w * 0.5, y0 + h * 0.5, 0,
+        x0 + w * 0.5, y0 + h * 0.5, Math.max(w, h) * 0.75
+      );
+      grad.addColorStop(0.0, bright2);
+      grad.addColorStop(0.35, bright);
+      grad.addColorStop(1.0, "rgba(207,231,255,0.0)");
+
+      g.fillStyle = grad;
+      g.fillRect(x0, y0, w, h);
+    }
+
+    // 微ノイズ
+    const img = g.getImageData(0, 0, size, size);
+    const d = img.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const n = (Math.random() - 0.5) * 6;
+      d[i]   = Math.max(0, Math.min(255, d[i]   + n));
+      d[i+1] = Math.max(0, Math.min(255, d[i+1] + n));
+      d[i+2] = Math.max(0, Math.min(255, d[i+2] + n));
+    }
+    g.putImageData(img, 0, 0);
+
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(1.6, 1.6);
+    tex.anisotropy = 8;
+    return tex;
   }
 
   // -----------------------------
-  // カメラ取得（front/back/usb）
+  // 箱（内側）
+  // -----------------------------
+  const boxSize = 2.8;
+  const wallTex = makeCheckerWithBrightPatches();
+
+  const boxGeo = new THREE.BoxGeometry(boxSize, boxSize, boxSize);
+  const boxMat = new THREE.MeshStandardMaterial({
+    map: wallTex,
+    roughness: 0.75,
+    metalness: 0.0,
+    side: THREE.BackSide,
+    emissive: new THREE.Color(0x0a0f16),
+    emissiveIntensity: 0.35
+  });
+  scene.add(new THREE.Mesh(boxGeo, boxMat));
+
+  // -----------------------------
+  // 光源：スポット強め（白飛びOK）
+  // -----------------------------
+  scene.add(new THREE.AmbientLight(0xffffff, 0.18));
+
+  const spotKey = new THREE.SpotLight(0xffffff, 140, 30, Math.PI / 7, 0.35, 1.4);
+  spotKey.position.set(0.8, 1.6, 2.3);
+  scene.add(spotKey);
+  scene.add(spotKey.target);
+
+  const spotFill = new THREE.SpotLight(0xcfe7ff, 35, 30, Math.PI / 6, 0.5, 1.2);
+  spotFill.position.set(-1.6, 0.9, 1.2);
+  scene.add(spotFill);
+  scene.add(spotFill.target);
+
+  scene.add(new THREE.HemisphereLight(0xbfdcff, 0x080a0f, 0.55));
+
+  const target = new THREE.Vector3(0, 0, 0);
+
+  // -----------------------------
+  // GLB：中央に浮かべる＋半分くらい＋回転
+  // -----------------------------
+  const loader = new GLTFLoader();
+  let modelRoot = null;
+  let modelBaseY = 0.10;
+
+  function normalizeAndPlaceModel(root) {
+    // まずバウンディング計算
+    const b = new THREE.Box3().setFromObject(root);
+    const size = new THREE.Vector3();
+    b.getSize(size);
+
+    const maxDim = Math.max(size.x, size.y, size.z, 1e-6);
+    const normalizeScale = 1.0 / maxDim;
+
+    // 「箱内で見栄えするサイズに正規化」→ さらに半分程度
+    const finalScale = normalizeScale * 0.8;
+    root.scale.setScalar(finalScale);
+
+    // スケール後にセンタリング
+    const b2 = new THREE.Box3().setFromObject(root);
+    const center = new THREE.Vector3();
+    b2.getCenter(center);
+    root.position.sub(center);
+
+    // 少し浮かせる
+    root.position.y += modelBaseY;
+
+    // 材質が暗いモデル救済（少しだけ）
+    root.traverse((o) => {
+      if (!o.isMesh) return;
+      const m = o.material;
+      if (!m) return;
+
+      if ("roughness" in m) m.roughness = Math.min(m.roughness, 0.65);
+      if ("metalness" in m) m.metalness = Math.max(m.metalness ?? 0, 0.05);
+
+      if ("emissive" in m) {
+        m.emissive = m.emissive || new THREE.Color(0x000000);
+        m.emissiveIntensity = Math.max(m.emissiveIntensity ?? 0, 0.06);
+      }
+      m.needsUpdate = true;
+    });
+  }
+
+  async function loadModelIfNeeded() {
+    if (isEmptyRoom) {
+      statusEl.textContent = "空っぽの部屋（市松）";
+      return;
+    }
+    statusEl.textContent = "3Dモデル読み込み中…";
+
+    const gltf = await loader.loadAsync(modelParam);
+    modelRoot = gltf.scene;
+
+    normalizeAndPlaceModel(modelRoot);
+    scene.add(modelRoot);
+
+    statusEl.textContent = "モデル表示中";
+  }
+
+  // -----------------------------
+  // Webカメラ取得
   // -----------------------------
   async function startCamera() {
     let constraints = { audio: false, video: {} };
 
     if (camMode === "usb") {
-      // 一覧から選んだdeviceIdを優先
       constraints.video = deviceId ? { deviceId: { exact: deviceId } } : true;
     } else if (camMode === "back") {
       constraints.video = { facingMode: { ideal: "environment" } };
@@ -158,80 +302,194 @@
   }
 
   // -----------------------------
-  // MediaPipe Face Landmarker（顔の向き推定）
+  // 顔追跡：最初にフォーカスした顔をロック追跡
   // -----------------------------
   let faceLandmarker = null;
   let lastVideoTime = -1;
 
-  // 顔の向き → three.js カメラへ（調整ポイント）
-  const basePos = new THREE.Vector3(0, 0, 2.15);  // 正面の距離
-  const maxShiftX = 0.55; // 左右
-  const maxShiftY = 0.35; // 上下
-  const maxShiftZ = 0.35; // 奥行き（近づく感じ）
+  // 「空中に固定した仮想カメラ」から「箱前面上の頭点」へ引いた直線上に実カメラを置く
+  const virtualEye = new THREE.Vector3(0, 0, 3.2);
 
-  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  // 箱の前面（入口側）
+  const frontZ = (boxSize * 0.5) - 0.01;
 
-  function applyHeadPose(yaw, pitch) {
-    // yaw/pitch はラジアン想定
-    const yn = clamp(yaw / 0.55, -1, 1);     // だいたい±0.55rad(±31°)を上限扱い
-    const pn = clamp(pitch / 0.45, -1, 1);   // だいたい±0.45rad(±26°)
+  // 画面内の頭位置 → 前面平面のスケール
+  const planeWidth = 1.9;
+  const planeHeight = 1.2;
 
-    camera.position.set(
-      basePos.x + yn * maxShiftX,
-      basePos.y + (-pn) * maxShiftY,
-      basePos.z - Math.abs(yn) * maxShiftZ
+  // 実カメラを直線上のどこに置くか（覗き込み強さ）
+  const baseT = 0.62;
+
+  // スムージング
+  const smoothPos = 0.18;
+  const smoothFov = 0.10;
+
+  // ズーム（起動時基準）
+  let baselineSize = null;
+  const zoomStrength = 0.55;
+  const maxZoomFovDelta = 12;
+
+  // ロック追跡パラメータ
+  let locked = false;
+  let lockCenter = { x: 0.5, y: 0.5 };
+  let lockSize = 0.20;
+  let lastGoodTime = performance.now();
+
+  const LOST_HOLD_MS = 900;
+  const MAX_ACCEPT_SCORE = 0.020;
+  const SIZE_WEIGHT = 0.6;
+
+  // カメラ目標＆スムース値
+  const desiredCamPos = new THREE.Vector3(0, 0, 2.25);
+  const smoothedCamPos = new THREE.Vector3(0, 0, 2.25);
+  let desiredFov = baseFov;
+  let smoothedFov = baseFov;
+
+  // 左右反転込み（環境で逆に見えた場合は、nx の先頭の - を外してください）
+  function head2DToFrontPlanePoint(cx01, cy01) {
+    const nx = -((cx01 - 0.5) * 2);
+    const ny = (0.5 - cy01) * 2;
+    return new THREE.Vector3(
+      nx * (planeWidth * 0.5),
+      ny * (planeHeight * 0.5),
+      frontZ
     );
-    camera.lookAt(target);
+  }
+
+  // ランドマークから「頭中心（重心）」と「顔サイズ（bbox）」を推定
+  function computeHeadFromLandmarks(landmarks) {
+    let sx = 0, sy = 0;
+    let minX =  1e9, minY =  1e9;
+    let maxX = -1e9, maxY = -1e9;
+
+    const n = landmarks.length;
+    for (let i = 0; i < n; i++) {
+      const p = landmarks[i];
+      sx += p.x; sy += p.y;
+      if (p.x < minX) minX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y > maxY) maxY = p.y;
+    }
+
+    const cx = sx / n;
+    const cy = sy / n;
+
+    const w = (maxX - minX);
+    const h = (maxY - minY);
+    const size = Math.max(w, h);
+
+    return { center: { x: cx, y: cy }, size };
+  }
+
+  // 複数顔からロック顔を選ぶ
+  function pickLockedFace(faceLandmarksList) {
+    const candidates = faceLandmarksList.map(lm => computeHeadFromLandmarks(lm));
+
+    // 初回：一番大きい顔をロック（だいたい手前）
+    if (!locked) {
+      let best = candidates[0];
+      for (const c of candidates) if (c.size > best.size) best = c;
+
+      locked = true;
+      lockCenter = { x: best.center.x, y: best.center.y };
+      lockSize = best.size;
+      lastGoodTime = performance.now();
+
+      // ズーム基準もここで確定（「最初にフォーカスした顔」基準）
+      baselineSize = best.size;
+
+      return { center: lockCenter, size: lockSize, score: 0 };
+    }
+
+    // ロック中：前回のロック特徴に一番近い候補を選ぶ
+    let best = null;
+    let bestScore = Infinity;
+
+    for (const c of candidates) {
+      const dx = c.center.x - lockCenter.x;
+      const dy = c.center.y - lockCenter.y;
+      const ds = c.size - lockSize;
+
+      const score = (dx*dx + dy*dy) + SIZE_WEIGHT * (ds*ds);
+      if (score < bestScore) {
+        bestScore = score;
+        best = c;
+      }
+    }
+
+    // 悪すぎる候補には飛びつかない
+    if (!best || bestScore > MAX_ACCEPT_SCORE) return null;
+
+    // ロック更新（じわっと）
+    const a = 0.35;
+    lockCenter = {
+      x: lockCenter.x + (best.center.x - lockCenter.x) * a,
+      y: lockCenter.y + (best.center.y - lockCenter.y) * a
+    };
+    lockSize = lockSize + (best.size - lockSize) * a;
+
+    lastGoodTime = performance.now();
+    return { center: lockCenter, size: lockSize, score: bestScore };
+  }
+
+  // 頭の2D位置＋仮想カメラから、実カメラを直線上へ（＋近づいたらズーム）
+  function applyLineOfSightCamera(headCenter, faceSize01) {
+    const headPoint = head2DToFrontPlanePoint(headCenter.x, headCenter.y);
+
+    // 近いほど覗き込みを少し強める
+    const depthBoost = clamp((faceSize01 - 0.18) * 1.2, -0.12, 0.22);
+    const t = clamp(baseT + depthBoost, 0.25, 0.92);
+    desiredCamPos.lerpVectors(virtualEye, headPoint, t);
+
+    // ズーム：起動時（ロック確定時）のサイズを基準に、近づいた分だけFOVを下げる
+    if (baselineSize === null) {
+      baselineSize = faceSize01;
+      desiredFov = baseFov;
+      return;
+    }
+
+    const ratio = faceSize01 / Math.max(1e-6, baselineSize);
+    const approach = Math.max(0, ratio - 1);
+    const fovDelta = clamp(approach * 30 * zoomStrength, 0, maxZoomFovDelta);
+    desiredFov = baseFov - fovDelta;
   }
 
   async function initFaceLandmarker() {
-    statusEl.textContent = "顔トラッキング初期化中…";
+    statusEl.textContent += " / 顔トラッキング初期化…";
 
-    // 公式ガイドの流れ（wasm root をCDNから）
     const vision = await FilesetResolver.forVisionTasks(
-      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+      `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/wasm`
     );
 
     faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
       baseOptions: {
-        // 公式配布のモデル（URL直指定）
         modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
         delegate: "GPU"
       },
       runningMode: "VIDEO",
-      numFaces: 1,
-      outputFacialTransformationMatrixes: true,
+      numFaces: 3, // ★複数顔を拾う（ロック追跡に必要）
+      outputFacialTransformationMatrixes: false,
       outputFaceBlendshapes: false
     });
 
-    statusEl.textContent = "動作中（顔の向きで視点が動きます）";
+    statusEl.textContent = (isEmptyRoom ? "空っぽの部屋（市松）" : "モデル表示中") + " / ロック追跡ON";
   }
 
-  // transformation matrix → yaw/pitch 抽出
-  const m4 = new THREE.Matrix4();
-  const euler = new THREE.Euler(0, 0, 0, "YXZ");
+  // -----------------------------
+  // アニメーションループ
+  // -----------------------------
+  const rotSpeed = 0.25; // rad/s
+  let lastT = performance.now();
+  let lastScore = 0;
 
-  function extractYawPitchFromMatrix(matArray16) {
-    // MediaPipeの配列は 4x4 の行列（16要素）。three.jsは内部が列優先だが、
-    // set() に突っ込むときは「要素の並び」を合わせればOK。
-    // ここでは一般的な例として、そのまま set(...arr) で入れて試し、
-    // もし回転が変なら arr の転置を試す、という調整余地を残しています。
-    m4.set(
-      matArray16[0], matArray16[1], matArray16[2],  matArray16[3],
-      matArray16[4], matArray16[5], matArray16[6],  matArray16[7],
-      matArray16[8], matArray16[9], matArray16[10], matArray16[11],
-      matArray16[12],matArray16[13],matArray16[14], matArray16[15]
-    );
-    euler.setFromRotationMatrix(m4);
-    const yaw = euler.y;
-    const pitch = euler.x;
-    return { yaw, pitch };
-  }
-
-  function onFrame() {
+  function onFrame(now = performance.now()) {
     requestAnimationFrame(onFrame);
 
-    // resize
+    const dt = Math.min(0.05, (now - lastT) / 1000);
+    lastT = now;
+
+    // リサイズ
     const w = wrap.clientWidth, h = wrap.clientHeight;
     if (renderer.domElement.width !== Math.floor(w * renderer.getPixelRatio()) ||
         renderer.domElement.height !== Math.floor(h * renderer.getPixelRatio())) {
@@ -240,44 +498,95 @@
       camera.updateProjectionMatrix();
     }
 
-    // face tracking
+    // モデル回転
+    if (modelRoot) {
+      modelRoot.rotation.y += rotSpeed * dt;
+    }
+
+    // スポットのターゲットは常にモデル中心付近
+    const focusY = modelRoot ? modelBaseY : 0.08;
+    spotKey.target.position.set(0, focusY, 0);
+    spotFill.target.position.set(0, focusY, 0);
+
+    // 顔追跡
     if (faceLandmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
       const ts = performance.now();
       const res = faceLandmarker.detectForVideo(video, ts);
       lastVideoTime = video.currentTime;
 
-      const mats = res.facialTransformationMatrixes;
-      if (mats && mats.length > 0) {
-        const arr = mats[0].data; // 16要素
-        const { yaw, pitch } = extractYawPitchFromMatrix(arr);
-        applyHeadPose(yaw, pitch);
-        msgEl.textContent =
-          `・yaw(左右): ${(yaw*180/Math.PI).toFixed(1)}°  pitch(上下): ${(pitch*180/Math.PI).toFixed(1)}°\n` +
-          `・モデル: ${modelUrl.split("/").slice(-1)[0]}\n` +
-          `・カメラ: ${camMode}${(camMode==="usb" && deviceId) ? "（deviceId指定）" : ""}`;
+      const faces = res.faceLandmarks;
+
+      if (faces && faces.length > 0) {
+        const picked = pickLockedFace(faces);
+
+        if (picked) {
+          lastScore = picked.score;
+          applyLineOfSightCamera(picked.center, picked.size);
+        } else {
+          // 見失い：短時間は保持、それ以上はロック解除
+          if (now - lastGoodTime < LOST_HOLD_MS) {
+            applyLineOfSightCamera(lockCenter, lockSize);
+          } else {
+            locked = false;
+            baselineSize = null; // 次にロックした顔を新基準にする
+          }
+        }
       } else {
-        msgEl.textContent = "・顔が見つかりません（距離・明るさ・角度を調整）";
+        // 顔ゼロ
+        if (locked && (now - lastGoodTime < LOST_HOLD_MS)) {
+          applyLineOfSightCamera(lockCenter, lockSize);
+        } else {
+          locked = false;
+          baselineSize = null;
+        }
       }
     }
+
+    // スムージング（位置・FOV）
+    smoothedCamPos.lerp(desiredCamPos, smoothPos);
+    camera.position.copy(smoothedCamPos);
+    camera.lookAt(target);
+
+    smoothedFov += (desiredFov - smoothedFov) * smoothFov;
+    camera.fov = smoothedFov;
+    camera.updateProjectionMatrix();
+
+    // HUD
+    const ratio = (baselineSize === null) ? 1 : (lockSize / baselineSize);
+    msgEl.textContent =
+      `・ロック: ${locked ? "ON" : "OFF"}  score=${(lastScore ?? 0).toFixed(4)}  hold=${Math.max(0, LOST_HOLD_MS - (now - lastGoodTime)).toFixed(0)}ms\n` +
+      `・顔サイズ: ${lockSize.toFixed(4)}  基準: ${baselineSize === null ? "未設定" : baselineSize.toFixed(4)}  ratio=${ratio.toFixed(3)}\n` +
+      `・FOV: ${smoothedFov.toFixed(1)}  露出: ${renderer.toneMappingExposure.toFixed(2)}\n` +
+      `・表示: ${isEmptyRoom ? "空っぽの部屋（市松）" : modelParam.split("/").slice(-1)[0]}\n` +
+      `・ライト: key=${spotKey.intensity.toFixed(0)} fill=${spotFill.intensity.toFixed(0)}（白飛びOK）`;
 
     renderer.render(scene, camera);
   }
 
+  // -----------------------------
   // 起動
+  // -----------------------------
   (async function boot() {
     try {
-      await loadModel(modelUrl);
+      await loadModelIfNeeded();
       await startCamera();
-      await initFaceLandmarker();
 
-      // 初期カメラ
-      camera.position.copy(basePos);
+      // 初期値
+      desiredCamPos.set(0, 0, 2.25);
+      smoothedCamPos.copy(desiredCamPos);
+      desiredFov = smoothedFov = baseFov;
+
+      locked = false;
+      baselineSize = null;
+
+      camera.position.copy(smoothedCamPos);
       camera.lookAt(target);
 
-      onFrame();
+      await initFaceLandmarker();
+      requestAnimationFrame(onFrame);
     } catch (e) {
       console.error(e);
-      statusEl.textContent = "エラー（カメラ許可・HTTPS・モデル配置を確認）";
+      statusEl.textContent = "エラー（カメラ許可・CDN・モデル・顔追跡）";
       msgEl.textContent = String(e);
     }
   })();
