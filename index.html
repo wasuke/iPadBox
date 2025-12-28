@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>奥行き錯覚テスト - 設定</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; font-family: system-ui, -apple-system, "Hiragino Sans", sans-serif; background:#0b0f14; color:#e8eef6; }
+    header { padding: 18px 16px 8px; }
+    h1 { margin: 0 0 6px; font-size: 18px; }
+    p { margin: 0; opacity: .85; font-size: 13px; line-height: 1.45; }
+    main { padding: 12px 16px 24px; display: grid; gap: 14px; }
+    .card { background: #111926; border: 1px solid #22324a; border-radius: 14px; padding: 14px; }
+    .row { display:flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    label { font-size: 14px; }
+    select, button { font-size: 16px; padding: 10px 12px; border-radius: 12px; border: 1px solid #2a3a55; background:#0f1622; color:#e8eef6; }
+    button { background:#1a3a6a; border-color:#2b62b0; font-weight: 600; }
+    button:disabled { opacity:.5; }
+    .hint { font-size: 12px; opacity:.85; margin-top: 8px; }
+    .warn { color:#ffcf7a; }
+    .ok { color:#a7ffb3; }
+    .small { font-size: 12px; opacity: .8; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>奥行き錯覚テスト（設定）</h1>
+  <p>最初にカメラの許可が必要です。許可後に「USBカメラ」が一覧に出ます（接続済みの場合）。</p>
+</header>
+
+<main>
+  <section class="card">
+    <div class="row" style="justify-content:space-between;">
+      <strong>1) カメラ選択</strong>
+      <button id="btnPerm">カメラ許可→一覧更新</button>
+    </div>
+
+    <div style="margin-top:12px; display:grid; gap:10px;">
+      <label><input type="radio" name="camMode" value="front" checked> メインカメラ（前面）</label>
+      <label><input type="radio" name="camMode" value="back"> 背面カメラ</label>
+      <label><input type="radio" name="camMode" value="usb"> USBカメラ（一覧から選択）</label>
+
+      <div class="row">
+        <label for="deviceSelect" class="small">利用可能なカメラ一覧：</label>
+        <select id="deviceSelect" style="flex:1; min-width: 220px;">
+          <option value="">（未取得）</option>
+        </select>
+      </div>
+
+      <div id="camStatus" class="hint warn">・まだカメラ一覧を取得していません</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <strong>2) コンテンツ選択（3Dモデル）</strong>
+    <div class="row" style="margin-top:10px;">
+      <select id="modelSelect" style="flex:1; min-width: 220px;">
+        <option value="assets/models/DamagedHelmet.glb">サンプル：Damaged Helmet（glb）</option>
+        <!-- ここにあなたの .glb を追加していく想定 -->
+        <!-- 例: <option value="assets/models/your_smithsonian_model.glb">Smithsonian: 〜</option> -->
+      </select>
+    </div>
+    <div class="hint">
+      ・スミソニアンの3Dは 3d.si.edu（Open Access/CC0）や Sketchfab の Smithsonian アカウントから取得できます。 [oai_citation:2‡3D Digitization](https://3d.si.edu/?utm_source=chatgpt.com)
+    </div>
+  </section>
+
+  <section class="card">
+    <strong>3) 起動</strong>
+    <div class="row" style="margin-top:10px;">
+      <button id="btnStart" disabled>デモ開始（全画面）</button>
+      <span class="small">※ iPadはユーザー操作がないと全画面にできないことがあります</span>
+    </div>
+  </section>
+</main>
+
+<script>
+  const btnPerm = document.getElementById("btnPerm");
+  const btnStart = document.getElementById("btnStart");
+  const deviceSelect = document.getElementById("deviceSelect");
+  const camStatus = document.getElementById("camStatus");
+
+  async function refreshDevices() {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cams = devices.filter(d => d.kind === "videoinput");
+
+    deviceSelect.innerHTML = "";
+    if (cams.length === 0) {
+      deviceSelect.innerHTML = `<option value="">（カメラが見つかりません）</option>`;
+      camStatus.textContent = "・カメラが見つかりません（許可がないか、未接続の可能性）";
+      camStatus.className = "hint warn";
+      btnStart.disabled = true;
+      return;
+    }
+
+    for (const cam of cams) {
+      const opt = document.createElement("option");
+      opt.value = cam.deviceId;
+      opt.textContent = cam.label || `Camera (${cam.deviceId.slice(0,6)}…)`;
+      deviceSelect.appendChild(opt);
+    }
+
+    camStatus.textContent = `・カメラ ${cams.length} 台を検出しました（USBもここに出ます）`;
+    camStatus.className = "hint ok";
+    btnStart.disabled = false;
+  }
+
+  btnPerm.addEventListener("click", async () => {
+    try {
+      // まず許可を取る（ラベルが出るのは多くの場合ここから）
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      stream.getTracks().forEach(t => t.stop());
+      await refreshDevices();
+    } catch (e) {
+      camStatus.textContent = "・カメラ許可が得られませんでした（ブラウザ設定を確認）";
+      camStatus.className = "hint warn";
+      btnStart.disabled = true;
+    }
+  });
+
+  btnStart.addEventListener("click", () => {
+    const camMode = document.querySelector('input[name="camMode"]:checked').value;
+    const deviceId = deviceSelect.value || "";
+    const modelUrl = document.getElementById("modelSelect").value;
+
+    const sp = new URLSearchParams();
+    sp.set("camMode", camMode);
+    if (deviceId) sp.set("deviceId", deviceId);
+    sp.set("model", modelUrl);
+
+    location.href = `viewer.html?${sp.toString()}`;
+  });
+</script>
+</body>
+</html>

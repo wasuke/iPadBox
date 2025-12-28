@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>奥行き錯覚テスト - Viewer</title>
+
+  <!-- three.js（importmap方式） -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <!-- MediaPipe Tasks Vision（公式ガイドのCDN例） -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.js" crossorigin="anonymous"></script>
+
+  <style>
+    :root { color-scheme: dark; }
+    body { margin:0; overflow:hidden; background:#000; font-family: system-ui, -apple-system, "Hiragino Sans", sans-serif; }
+    #wrap { position: fixed; inset: 0; }
+    canvas { display:block; width:100%; height:100%; }
+
+    /* 解析用ビデオ（非表示） */
+    #video { position: fixed; right: 8px; bottom: 8px; width: 160px; height: 120px; opacity: .0; pointer-events:none; }
+
+    /* UI */
+    #hud {
+      position: fixed; left: 12px; top: 12px; right: 12px;
+      display:flex; gap:10px; align-items:center; justify-content:space-between;
+      background: rgba(0,0,0,.45); border: 1px solid rgba(255,255,255,.14);
+      border-radius: 14px; padding: 10px 12px; backdrop-filter: blur(8px);
+      color:#e8eef6; font-size: 13px;
+    }
+    #hud .left { display:flex; flex-direction:column; gap:2px; }
+    #hud .title { font-weight: 700; font-size: 13px; }
+    #hud .sub { opacity:.85; font-size: 12px; }
+    #hud button {
+      font-size: 14px; padding: 8px 10px; border-radius: 12px;
+      border: 1px solid rgba(255,255,255,.18); background: rgba(20,60,120,.6); color: #fff;
+    }
+    #msg {
+      position: fixed; left: 12px; bottom: 12px;
+      background: rgba(0,0,0,.45); border: 1px solid rgba(255,255,255,.14);
+      border-radius: 14px; padding: 10px 12px; color:#e8eef6; font-size: 12px;
+      max-width: min(560px, calc(100vw - 24px));
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+<div id="wrap"></div>
+<video id="video" autoplay playsinline muted></video>
+
+<div id="hud">
+  <div class="left">
+    <div class="title">奥行き錯覚テスト</div>
+    <div id="status" class="sub">起動中…</div>
+  </div>
+  <div class="right">
+    <button id="btnFS">全画面</button>
+    <button id="btnBack">戻る</button>
+  </div>
+</div>
+
+<div id="msg">・カメラ許可が必要です
+・顔が映る距離で、左右に首を振ると視点が追従します</div>
+
+<script type="module">
+  import * as THREE from "three";
+  import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+
+  const wrap = document.getElementById("wrap");
+  const statusEl = document.getElementById("status");
+  const msgEl = document.getElementById("msg");
+  const video = document.getElementById("video");
+
+  document.getElementById("btnBack").addEventListener("click", () => history.back());
+  document.getElementById("btnFS").addEventListener("click", async () => {
+    try { await document.documentElement.requestFullscreen(); } catch {}
+  });
+
+  const qs = new URLSearchParams(location.search);
+  const camMode = qs.get("camMode") || "front";         // front | back | usb
+  const deviceId = qs.get("deviceId") || "";
+  const modelUrl = qs.get("model") || "assets/models/DamagedHelmet.glb";
+
+  // -----------------------------
+  // three.js シーン（iPadの中を箱にする）
+  // -----------------------------
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  wrap.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x000000);
+
+  const camera = new THREE.PerspectiveCamera(55, 1, 0.01, 50);
+
+  // 箱（内側表示＝BackSide）
+  const boxSize = 2.6;
+  const boxGeo = new THREE.BoxGeometry(boxSize, boxSize, boxSize);
+  const boxMat = new THREE.MeshStandardMaterial({
+    color: 0x0f1722,
+    roughness: 0.95,
+    metalness: 0.0,
+    side: THREE.BackSide
+  });
+  const box = new THREE.Mesh(boxGeo, boxMat);
+  scene.add(box);
+
+  // ライト
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const key = new THREE.DirectionalLight(0xffffff, 1.1);
+  key.position.set(1.5, 2.0, 1.2);
+  scene.add(key);
+
+  // 中央の基準点
+  const target = new THREE.Vector3(0, 0, 0);
+
+  // モデル読み込み
+  const loader = new GLTFLoader();
+  let modelRoot = null;
+
+  async function loadModel(url) {
+    statusEl.textContent = "3Dモデル読み込み中…";
+    const gltf = await loader.loadAsync(url);
+    modelRoot = gltf.scene;
+    // 適当にスケール調整（モデルによって変えてください）
+    modelRoot.scale.setScalar(1.2);
+    modelRoot.position.set(0, -0.55, 0);
+    scene.add(modelRoot);
+    statusEl.textContent = "カメラ起動待ち…";
+  }
+
+  // -----------------------------
+  // カメラ取得（front/back/usb）
+  // -----------------------------
+  async function startCamera() {
+    let constraints = { audio: false, video: {} };
+
+    if (camMode === "usb") {
+      // 一覧から選んだdeviceIdを優先
+      constraints.video = deviceId ? { deviceId: { exact: deviceId } } : true;
+    } else if (camMode === "back") {
+      constraints.video = { facingMode: { ideal: "environment" } };
+    } else {
+      constraints.video = { facingMode: { ideal: "user" } };
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    video.srcObject = stream;
+    await video.play();
+  }
+
+  // -----------------------------
+  // MediaPipe Face Landmarker（顔の向き推定）
+  // -----------------------------
+  let faceLandmarker = null;
+  let lastVideoTime = -1;
+
+  // 顔の向き → three.js カメラへ（調整ポイント）
+  const basePos = new THREE.Vector3(0, 0, 2.15);  // 正面の距離
+  const maxShiftX = 0.55; // 左右
+  const maxShiftY = 0.35; // 上下
+  const maxShiftZ = 0.35; // 奥行き（近づく感じ）
+
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  function applyHeadPose(yaw, pitch) {
+    // yaw/pitch はラジアン想定
+    const yn = clamp(yaw / 0.55, -1, 1);     // だいたい±0.55rad(±31°)を上限扱い
+    const pn = clamp(pitch / 0.45, -1, 1);   // だいたい±0.45rad(±26°)
+
+    camera.position.set(
+      basePos.x + yn * maxShiftX,
+      basePos.y + (-pn) * maxShiftY,
+      basePos.z - Math.abs(yn) * maxShiftZ
+    );
+    camera.lookAt(target);
+  }
+
+  async function initFaceLandmarker() {
+    statusEl.textContent = "顔トラッキング初期化中…";
+
+    // 公式ガイドの流れ（wasm root をCDNから）
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+    );
+
+    faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        // 公式配布のモデル（URL直指定）
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      numFaces: 1,
+      outputFacialTransformationMatrixes: true,
+      outputFaceBlendshapes: false
+    });
+
+    statusEl.textContent = "動作中（顔の向きで視点が動きます）";
+  }
+
+  // transformation matrix → yaw/pitch 抽出
+  const m4 = new THREE.Matrix4();
+  const euler = new THREE.Euler(0, 0, 0, "YXZ");
+
+  function extractYawPitchFromMatrix(matArray16) {
+    // MediaPipeの配列は 4x4 の行列（16要素）。three.jsは内部が列優先だが、
+    // set() に突っ込むときは「要素の並び」を合わせればOK。
+    // ここでは一般的な例として、そのまま set(...arr) で入れて試し、
+    // もし回転が変なら arr の転置を試す、という調整余地を残しています。
+    m4.set(
+      matArray16[0], matArray16[1], matArray16[2],  matArray16[3],
+      matArray16[4], matArray16[5], matArray16[6],  matArray16[7],
+      matArray16[8], matArray16[9], matArray16[10], matArray16[11],
+      matArray16[12],matArray16[13],matArray16[14], matArray16[15]
+    );
+    euler.setFromRotationMatrix(m4);
+    const yaw = euler.y;
+    const pitch = euler.x;
+    return { yaw, pitch };
+  }
+
+  function onFrame() {
+    requestAnimationFrame(onFrame);
+
+    // resize
+    const w = wrap.clientWidth, h = wrap.clientHeight;
+    if (renderer.domElement.width !== Math.floor(w * renderer.getPixelRatio()) ||
+        renderer.domElement.height !== Math.floor(h * renderer.getPixelRatio())) {
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    // face tracking
+    if (faceLandmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+      const ts = performance.now();
+      const res = faceLandmarker.detectForVideo(video, ts);
+      lastVideoTime = video.currentTime;
+
+      const mats = res.facialTransformationMatrixes;
+      if (mats && mats.length > 0) {
+        const arr = mats[0].data; // 16要素
+        const { yaw, pitch } = extractYawPitchFromMatrix(arr);
+        applyHeadPose(yaw, pitch);
+        msgEl.textContent =
+          `・yaw(左右): ${(yaw*180/Math.PI).toFixed(1)}°  pitch(上下): ${(pitch*180/Math.PI).toFixed(1)}°\n` +
+          `・モデル: ${modelUrl.split("/").slice(-1)[0]}\n` +
+          `・カメラ: ${camMode}${(camMode==="usb" && deviceId) ? "（deviceId指定）" : ""}`;
+      } else {
+        msgEl.textContent = "・顔が見つかりません（距離・明るさ・角度を調整）";
+      }
+    }
+
+    renderer.render(scene, camera);
+  }
+
+  // 起動
+  (async function boot() {
+    try {
+      await loadModel(modelUrl);
+      await startCamera();
+      await initFaceLandmarker();
+
+      // 初期カメラ
+      camera.position.copy(basePos);
+      camera.lookAt(target);
+
+      onFrame();
+    } catch (e) {
+      console.error(e);
+      statusEl.textContent = "エラー（カメラ許可・HTTPS・モデル配置を確認）";
+      msgEl.textContent = String(e);
+    }
+  })();
+</script>
+</body>
+</html>
