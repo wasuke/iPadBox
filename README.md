@@ -37,7 +37,7 @@ iPad（Safari）を主な対象とし、カメラで取得した顔の位置に�
 - macOS / Windows（Chrome, Safari）  
 - HTTPS 環境（GitHub Pages / Live Server など）
 
-※ カメラ使用のため **HTTPS または localhost** が必須です。
+※ カメラ使用のため **HTTPS または localhost** が必要かもしれません（多分、無くても大丈夫）。
 
 ---
 
@@ -47,7 +47,7 @@ iPad（Safari）を主な対象とし、カメラで取得した顔の位置に�
 2. `index.html` をブラウザで開く  
 3. カメラアクセスを許可  
 4. 画面中央に顔を置いて体験
-DemoPage→https://wasuke.github.io/iPadBox/
+5. DemoPage→https://wasuke.github.io/iPadBox/
 
 GLBモデルを表示する場合は、URL パラメータで指定します。
 
