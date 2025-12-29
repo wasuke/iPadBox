@@ -44,9 +44,10 @@ iPad（Safari）を主な対象とし、カメラで取得した顔の位置に�
 ## 使い方（概要）
 
 1. このリポジトリを GitHub Pages またはローカルサーバで公開  
-2. `viewer.html` をブラウザで開く  
+2. `index.html` をブラウザで開く  
 3. カメラアクセスを許可  
 4. 画面中央に顔を置いて体験
+DemoPage→https://wasuke.github.io/iPadBox/
 
 GLBモデルを表示する場合は、URL パラメータで指定します。
 
