@@ -22,7 +22,6 @@
     #wrap { position: fixed; inset: 0; }
     canvas { display:block; width:100%; height:100%; }
 
-    /* デバッグ用：必要なら opacity を 0.25 などに上げる */
     #video { position: fixed; right: 8px; bottom: 8px; width: 160px; height: 120px; opacity: 0; pointer-events:none; }
 
     #hud{
@@ -65,16 +64,16 @@
   </div>
 </div>
 
-<div id="msg">・最初にフォーカスした顔を追い続けます（完全固定ではないが安定寄り）
-・近づいた分だけズーム（起動時の顔サイズが基準）
-・GLBは中央に小さめで浮いて、ゆっくり回転
-・壁は市松＋明るいパッチ、スポットライト強め（白飛びOK）</div>
+<div id="msg">起動中…</div>
 
 <script type="module">
   import * as THREE from "three";
   import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
-  // MediaPipe Tasks Vision（ESM import）
+  import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
+  import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js";
+  import { LineMaterial } from "three/addons/lines/LineMaterial.js";
+
   const MP_VER = "0.10.22-rc.20250304";
   const { FaceLandmarker, FilesetResolver } = await import(
     `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/vision_bundle.mjs`
@@ -91,35 +90,41 @@
   });
 
   const qs = new URLSearchParams(location.search);
-  const camMode = qs.get("camMode") || "front";  // front | back | usb
+  const camMode = qs.get("camMode") || "front";
   const deviceId = qs.get("deviceId") || "";
   const modelParam = qs.get("model") || "__EMPTY_ROOM__";
   const isEmptyRoom = (modelParam === "__EMPTY_ROOM__");
 
-  // -----------------------------
-  // three.js：レンダラ／シーン／カメラ
-  // -----------------------------
+  const roomType = (qs.get("room") || "checker").toLowerCase();
+  const rotateEnabled = (qs.get("rotate") ?? "1") !== "0";
+
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
-
-  // 白飛びOKの方向へ
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.6;
 
   wrap.appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x040508);
+  scene.background = new THREE.Color(0x000000);
 
   const baseFov = 55;
   const camera = new THREE.PerspectiveCamera(baseFov, 1, 0.01, 50);
 
-  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  // 部屋（20%小さく）
+  const boxSize = 2.8 * 0.5;
+  let roomGroup = null;
 
-  // -----------------------------
-  // 壁テクスチャ：市松＋明るいパッチ
-  // -----------------------------
+  let neonPrimaryMat = null;
+  let neonHaloMat = null;
+
+  // 荒い格子：4分割 → 内線3本
+  const neonGridDiv = 4;
+  const eps = 0.001;
+
   function makeCheckerWithBrightPatches({
     size = 1024,
     cells = 12,
@@ -134,7 +139,6 @@
 
     const cell = size / cells;
 
-    // 市松
     for (let y = 0; y < cells; y++) {
       for (let x = 0; x < cells; x++) {
         g.fillStyle = ((x + y) % 2 === 0) ? darkA : darkB;
@@ -142,7 +146,6 @@
       }
     }
 
-    // 明るいパッチ（グローっぽく）
     const patches = Math.floor(cells * 1.2);
     for (let i = 0; i < patches; i++) {
       const px = Math.floor(Math.random() * cells);
@@ -165,7 +168,6 @@
       g.fillRect(x0, y0, w, h);
     }
 
-    // 微ノイズ
     const img = g.getImageData(0, 0, size, size);
     const d = img.data;
     for (let i = 0; i < d.length; i += 4) {
@@ -184,27 +186,119 @@
     return tex;
   }
 
-  // -----------------------------
-  // 箱（内側）
-  // -----------------------------
-  const boxSize = 2.8;
-  const wallTex = makeCheckerWithBrightPatches();
+  // ★ ネオン：外枠＋荒い格子（ただし「手前面の格子だけ無し」）
+  function makeNeonEdgesGroup() {
+    const g = new THREE.Group();
+    const half = boxSize * 0.5;
 
-  const boxGeo = new THREE.BoxGeometry(boxSize, boxSize, boxSize);
-  const boxMat = new THREE.MeshStandardMaterial({
-    map: wallTex,
-    roughness: 0.75,
-    metalness: 0.0,
-    side: THREE.BackSide,
-    emissive: new THREE.Color(0x0a0f16),
-    emissiveIntensity: 0.35
-  });
-  scene.add(new THREE.Mesh(boxGeo, boxMat));
+    const positions = [];
+    const pushSeg = (x1,y1,z1, x2,y2,z2) => positions.push(x1,y1,z1, x2,y2,z2);
 
-  // -----------------------------
-  // 光源：スポット強め（白飛びOK）
-  // -----------------------------
-  scene.add(new THREE.AmbientLight(0xffffff, 0.18));
+    // 1) 外枠（必ず残す）
+    {
+      const geo = new THREE.BoxGeometry(boxSize, boxSize, boxSize);
+      const edges = new THREE.EdgesGeometry(geo);
+      const arr = edges.attributes.position.array;
+      for (let i = 0; i < arr.length; i++) positions.push(arr[i]);
+    }
+
+    // 2) 格子：各面に追加。ただし「手前面（Z=+側）」は追加しない
+    const step = (2 * half) / neonGridDiv;
+
+    // Z面：奥側のみ（Z=-half+eps）に格子を追加
+    // ※カメラは通常 +Z 側から見ているので、Z=+ は「手前」
+    {
+      const z = -half + eps; // 奥
+      for (let k = 1; k < neonGridDiv; k++) {
+        const x = -half + step * k;
+        pushSeg(x, -half, z,  x,  half, z);     // 縦（Y方向）
+        const y = -half + step * k;
+        pushSeg(-half, y, z,  half, y, z);      // 横（X方向）
+      }
+    }
+
+    // X面：左右（両方）に格子
+    for (const x of [half - eps, -half + eps]) {
+      for (let k = 1; k < neonGridDiv; k++) {
+        const z = -half + step * k;
+        pushSeg(x, -half, z,  x,  half, z);     // 縦（Y方向）
+        const y = -half + step * k;
+        pushSeg(x, y, -half,  x, y,  half);     // 横（Z方向）
+      }
+    }
+
+    // Y面：上下（両方）に格子
+    for (const y of [half - eps, -half + eps]) {
+      for (let k = 1; k < neonGridDiv; k++) {
+        const x = -half + step * k;
+        pushSeg(x, y, -half,  x, y,  half);     // 縦（X方向）
+        const z = -half + step * k;
+        pushSeg(-half, y, z,  half, y, z);      // 横（Z方向）
+      }
+    }
+
+    const lineGeo = new LineSegmentsGeometry();
+    lineGeo.setPositions(positions);
+
+    neonPrimaryMat = new LineMaterial({
+      color: 0x00ffff,
+      transparent: true,
+      opacity: 0.95,
+      linewidth: 10.0,
+      worldUnits: false
+    });
+
+    neonHaloMat = new LineMaterial({
+      color: 0x00ffff,
+      transparent: true,
+      opacity: 0.20,
+      linewidth: 20.0,
+      worldUnits: false
+    });
+
+    const lines = new LineSegments2(lineGeo, neonPrimaryMat);
+    const halo  = new LineSegments2(lineGeo, neonHaloMat);
+    halo.scale.setScalar(1.003);
+
+    g.add(halo);
+    g.add(lines);
+    return g;
+  }
+
+  function buildRoom(type) {
+    const g = new THREE.Group();
+    neonPrimaryMat = null;
+    neonHaloMat = null;
+
+    if (type === "neon") {
+      g.add(makeNeonEdgesGroup());
+      return g;
+    }
+
+    const wallTex = makeCheckerWithBrightPatches();
+    const boxGeo = new THREE.BoxGeometry(boxSize, boxSize, boxSize);
+    const boxMat = new THREE.MeshStandardMaterial({
+      map: wallTex,
+      roughness: 0.75,
+      metalness: 0.0,
+      side: THREE.BackSide,
+      emissive: new THREE.Color(0x0a0f16),
+      emissiveIntensity: 0.35
+    });
+    g.add(new THREE.Mesh(boxGeo, boxMat));
+    return g;
+  }
+
+  function setRoom(type) {
+    if (roomGroup) scene.remove(roomGroup);
+    roomGroup = buildRoom(type);
+    scene.add(roomGroup);
+  }
+
+  setRoom(roomType);
+
+  // 光源
+  scene.add(new THREE.AmbientLight(0xffffff, roomType === "neon" ? 0.10 : 0.18));
 
   const spotKey = new THREE.SpotLight(0xffffff, 140, 30, Math.PI / 7, 0.35, 1.4);
   spotKey.position.set(0.8, 1.6, 2.3);
@@ -216,120 +310,26 @@
   scene.add(spotFill);
   scene.add(spotFill.target);
 
-  scene.add(new THREE.HemisphereLight(0xbfdcff, 0x080a0f, 0.55));
+  scene.add(new THREE.HemisphereLight(0xbfdcff, 0x080a0f, roomType === "neon" ? 0.35 : 0.55));
 
   const target = new THREE.Vector3(0, 0, 0);
 
-  // -----------------------------
-  // GLB：中央に浮かべる＋半分くらい＋回転
-  // -----------------------------
-  const loader = new GLTFLoader();
-  let modelRoot = null;
-  let modelBaseY = 0.10;
-
-  function normalizeAndPlaceModel(root) {
-    // まずバウンディング計算
-    const b = new THREE.Box3().setFromObject(root);
-    const size = new THREE.Vector3();
-    b.getSize(size);
-
-    const maxDim = Math.max(size.x, size.y, size.z, 1e-6);
-    const normalizeScale = 1.0 / maxDim;
-
-    // 「箱内で見栄えするサイズに正規化」→ さらに半分程度
-    const finalScale = normalizeScale * 0.8;
-    root.scale.setScalar(finalScale);
-
-    // スケール後にセンタリング
-    const b2 = new THREE.Box3().setFromObject(root);
-    const center = new THREE.Vector3();
-    b2.getCenter(center);
-    root.position.sub(center);
-
-    // 少し浮かせる
-    root.position.y += modelBaseY;
-
-    // 材質が暗いモデル救済（少しだけ）
-    root.traverse((o) => {
-      if (!o.isMesh) return;
-      const m = o.material;
-      if (!m) return;
-
-      if ("roughness" in m) m.roughness = Math.min(m.roughness, 0.65);
-      if ("metalness" in m) m.metalness = Math.max(m.metalness ?? 0, 0.05);
-
-      if ("emissive" in m) {
-        m.emissive = m.emissive || new THREE.Color(0x000000);
-        m.emissiveIntensity = Math.max(m.emissiveIntensity ?? 0, 0.06);
-      }
-      m.needsUpdate = true;
-    });
-  }
-
-  async function loadModelIfNeeded() {
-    if (isEmptyRoom) {
-      statusEl.textContent = "空っぽの部屋（市松）";
-      return;
-    }
-    statusEl.textContent = "3Dモデル読み込み中…";
-
-    const gltf = await loader.loadAsync(modelParam);
-    modelRoot = gltf.scene;
-
-    normalizeAndPlaceModel(modelRoot);
-    scene.add(modelRoot);
-
-    statusEl.textContent = "モデル表示中";
-  }
-
-  // -----------------------------
-  // Webカメラ取得
-  // -----------------------------
-  async function startCamera() {
-    let constraints = { audio: false, video: {} };
-
-    if (camMode === "usb") {
-      constraints.video = deviceId ? { deviceId: { exact: deviceId } } : true;
-    } else if (camMode === "back") {
-      constraints.video = { facingMode: { ideal: "environment" } };
-    } else {
-      constraints.video = { facingMode: { ideal: "user" } };
-    }
-
-    const stream = await navigator.mediaDevices.getUserMedia(constraints);
-    video.srcObject = stream;
-    await video.play();
-  }
-
-  // -----------------------------
-  // 顔追跡：最初にフォーカスした顔をロック追跡
-  // -----------------------------
-  let faceLandmarker = null;
-  let lastVideoTime = -1;
-
-  // 「空中に固定した仮想カメラ」から「箱前面上の頭点」へ引いた直線上に実カメラを置く
+  // カメラ制御
   const virtualEye = new THREE.Vector3(0, 0, 3.2);
-
-  // 箱の前面（入口側）
   const frontZ = (boxSize * 0.5) - 0.01;
 
-  // 画面内の頭位置 → 前面平面のスケール
   const planeWidth = 1.9;
   const planeHeight = 1.2;
 
-  // 実カメラを直線上のどこに置くか（覗き込み強さ）
   const baseT = 0.62;
 
-  // スムージング
   const smoothPos = 0.18;
   const smoothFov = 0.10;
 
-  // ズーム（起動時基準）
   let baselineSize = null;
   const zoomStrength = 0.55;
   const maxZoomFovDelta = 12;
 
-  // ロック追跡パラメータ
   let locked = false;
   let lockCenter = { x: 0.5, y: 0.5 };
   let lockSize = 0.20;
@@ -339,13 +339,11 @@
   const MAX_ACCEPT_SCORE = 0.020;
   const SIZE_WEIGHT = 0.6;
 
-  // カメラ目標＆スムース値
   const desiredCamPos = new THREE.Vector3(0, 0, 2.25);
   const smoothedCamPos = new THREE.Vector3(0, 0, 2.25);
   let desiredFov = baseFov;
   let smoothedFov = baseFov;
 
-  // 左右反転込み（環境で逆に見えた場合は、nx の先頭の - を外してください）
   function head2DToFrontPlanePoint(cx01, cy01) {
     const nx = -((cx01 - 0.5) * 2);
     const ny = (0.5 - cy01) * 2;
@@ -356,7 +354,6 @@
     );
   }
 
-  // ランドマークから「頭中心（重心）」と「顔サイズ（bbox）」を推定
   function computeHeadFromLandmarks(landmarks) {
     let sx = 0, sy = 0;
     let minX =  1e9, minY =  1e9;
@@ -382,11 +379,9 @@
     return { center: { x: cx, y: cy }, size };
   }
 
-  // 複数顔からロック顔を選ぶ
   function pickLockedFace(faceLandmarksList) {
     const candidates = faceLandmarksList.map(lm => computeHeadFromLandmarks(lm));
 
-    // 初回：一番大きい顔をロック（だいたい手前）
     if (!locked) {
       let best = candidates[0];
       for (const c of candidates) if (c.size > best.size) best = c;
@@ -396,13 +391,11 @@
       lockSize = best.size;
       lastGoodTime = performance.now();
 
-      // ズーム基準もここで確定（「最初にフォーカスした顔」基準）
       baselineSize = best.size;
 
       return { center: lockCenter, size: lockSize, score: 0 };
     }
 
-    // ロック中：前回のロック特徴に一番近い候補を選ぶ
     let best = null;
     let bestScore = Infinity;
 
@@ -418,10 +411,8 @@
       }
     }
 
-    // 悪すぎる候補には飛びつかない
     if (!best || bestScore > MAX_ACCEPT_SCORE) return null;
 
-    // ロック更新（じわっと）
     const a = 0.35;
     lockCenter = {
       x: lockCenter.x + (best.center.x - lockCenter.x) * a,
@@ -433,16 +424,13 @@
     return { center: lockCenter, size: lockSize, score: bestScore };
   }
 
-  // 頭の2D位置＋仮想カメラから、実カメラを直線上へ（＋近づいたらズーム）
   function applyLineOfSightCamera(headCenter, faceSize01) {
     const headPoint = head2DToFrontPlanePoint(headCenter.x, headCenter.y);
 
-    // 近いほど覗き込みを少し強める
     const depthBoost = clamp((faceSize01 - 0.18) * 1.2, -0.12, 0.22);
     const t = clamp(baseT + depthBoost, 0.25, 0.92);
     desiredCamPos.lerpVectors(virtualEye, headPoint, t);
 
-    // ズーム：起動時（ロック確定時）のサイズを基準に、近づいた分だけFOVを下げる
     if (baselineSize === null) {
       baselineSize = faceSize01;
       desiredFov = baseFov;
@@ -454,6 +442,80 @@
     const fovDelta = clamp(approach * 30 * zoomStrength, 0, maxZoomFovDelta);
     desiredFov = baseFov - fovDelta;
   }
+
+  // GLB
+  const loader = new GLTFLoader();
+  let modelRoot = null;
+  let modelBaseY = 0.10;
+
+  function normalizeAndPlaceModel(root) {
+    const b = new THREE.Box3().setFromObject(root);
+    const size = new THREE.Vector3();
+    b.getSize(size);
+
+    const maxDim = Math.max(size.x, size.y, size.z, 1e-6);
+    const normalizeScale = 1.0 / maxDim;
+
+    const finalScale = normalizeScale * 0.8;
+    root.scale.setScalar(finalScale);
+
+    const b2 = new THREE.Box3().setFromObject(root);
+    const center = new THREE.Vector3();
+    b2.getCenter(center);
+    root.position.sub(center);
+
+    root.position.y += modelBaseY;
+
+    root.traverse((o) => {
+      if (!o.isMesh) return;
+      const m = o.material;
+      if (!m) return;
+
+      if ("roughness" in m) m.roughness = Math.min(m.roughness, 0.65);
+      if ("metalness" in m) m.metalness = Math.max(m.metalness ?? 0, 0.05);
+
+      if ("emissive" in m) {
+        m.emissive = m.emissive || new THREE.Color(0x000000);
+        m.emissiveIntensity = Math.max(m.emissiveIntensity ?? 0, 0.06);
+      }
+      m.needsUpdate = true;
+    });
+  }
+
+  async function loadModelIfNeeded() {
+    if (isEmptyRoom) {
+      statusEl.textContent = `空っぽの部屋 / room=${roomType}`;
+      return;
+    }
+    statusEl.textContent = "3Dモデル読み込み中…";
+
+    const gltf = await loader.loadAsync(modelParam);
+    modelRoot = gltf.scene;
+
+    normalizeAndPlaceModel(modelRoot);
+    scene.add(modelRoot);
+
+    statusEl.textContent = `モデル表示中 / room=${roomType}`;
+  }
+
+  async function startCamera() {
+    let constraints = { audio: false, video: {} };
+
+    if (camMode === "usb") {
+      constraints.video = deviceId ? { deviceId: { exact: deviceId } } : true;
+    } else if (camMode === "back") {
+      constraints.video = { facingMode: { ideal: "environment" } };
+    } else {
+      constraints.video = { facingMode: { ideal: "user" } };
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    video.srcObject = stream;
+    await video.play();
+  }
+
+  let faceLandmarker = null;
+  let lastVideoTime = -1;
 
   async function initFaceLandmarker() {
     statusEl.textContent += " / 顔トラッキング初期化…";
@@ -468,18 +530,24 @@
         delegate: "GPU"
       },
       runningMode: "VIDEO",
-      numFaces: 3, // ★複数顔を拾う（ロック追跡に必要）
+      numFaces: 3,
       outputFacialTransformationMatrixes: false,
       outputFaceBlendshapes: false
     });
 
-    statusEl.textContent = (isEmptyRoom ? "空っぽの部屋（市松）" : "モデル表示中") + " / ロック追跡ON";
+    statusEl.textContent = (isEmptyRoom ? `空っぽの部屋 / room=${roomType}` : `モデル表示中 / room=${roomType}`) + " / ロック追跡ON";
   }
 
-  // -----------------------------
-  // アニメーションループ
-  // -----------------------------
-  const rotSpeed = 0.25; // rad/s
+  function updateNeonLinewidth() {
+    if (!neonPrimaryMat || !neonHaloMat) return;
+    const d = camera.position.length();
+    const primary = clamp(25 / Math.max(0.1, d), 2.0, 10.0);
+    const halo = clamp(primary * 2.0, 4.0, 22.0);
+    neonPrimaryMat.linewidth = primary;
+    neonHaloMat.linewidth = halo;
+  }
+
+  const rotSpeed = 0.25;
   let lastT = performance.now();
   let lastScore = 0;
 
@@ -489,26 +557,29 @@
     const dt = Math.min(0.05, (now - lastT) / 1000);
     lastT = now;
 
-    // リサイズ
     const w = wrap.clientWidth, h = wrap.clientHeight;
-    if (renderer.domElement.width !== Math.floor(w * renderer.getPixelRatio()) ||
-        renderer.domElement.height !== Math.floor(h * renderer.getPixelRatio())) {
+
+    const needResize =
+      renderer.domElement.width !== Math.floor(w * renderer.getPixelRatio()) ||
+      renderer.domElement.height !== Math.floor(h * renderer.getPixelRatio());
+
+    if (needResize) {
       renderer.setSize(w, h, false);
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
+
+      if (neonPrimaryMat) neonPrimaryMat.resolution.set(w, h);
+      if (neonHaloMat) neonHaloMat.resolution.set(w, h);
     }
 
-    // モデル回転
-    if (modelRoot) {
+    if (modelRoot && rotateEnabled) {
       modelRoot.rotation.y += rotSpeed * dt;
     }
 
-    // スポットのターゲットは常にモデル中心付近
     const focusY = modelRoot ? modelBaseY : 0.08;
     spotKey.target.position.set(0, focusY, 0);
     spotFill.target.position.set(0, focusY, 0);
 
-    // 顔追跡
     if (faceLandmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
       const ts = performance.now();
       const res = faceLandmarker.detectForVideo(video, ts);
@@ -523,16 +594,14 @@
           lastScore = picked.score;
           applyLineOfSightCamera(picked.center, picked.size);
         } else {
-          // 見失い：短時間は保持、それ以上はロック解除
           if (now - lastGoodTime < LOST_HOLD_MS) {
             applyLineOfSightCamera(lockCenter, lockSize);
           } else {
             locked = false;
-            baselineSize = null; // 次にロックした顔を新基準にする
+            baselineSize = null;
           }
         }
       } else {
-        // 顔ゼロ
         if (locked && (now - lastGoodTime < LOST_HOLD_MS)) {
           applyLineOfSightCamera(lockCenter, lockSize);
         } else {
@@ -542,7 +611,6 @@
       }
     }
 
-    // スムージング（位置・FOV）
     smoothedCamPos.lerp(desiredCamPos, smoothPos);
     camera.position.copy(smoothedCamPos);
     camera.lookAt(target);
@@ -551,27 +619,28 @@
     camera.fov = smoothedFov;
     camera.updateProjectionMatrix();
 
-    // HUD
+    updateNeonLinewidth();
+
     const ratio = (baselineSize === null) ? 1 : (lockSize / baselineSize);
     msgEl.textContent =
-      `・ロック: ${locked ? "ON" : "OFF"}  score=${(lastScore ?? 0).toFixed(4)}  hold=${Math.max(0, LOST_HOLD_MS - (now - lastGoodTime)).toFixed(0)}ms\n` +
+      `・room: ${roomType}（neon は手前面格子なし）\n` +
+      `・回転: ${rotateEnabled ? "ON" : "OFF"}\n` +
+      `・部屋サイズ: ${boxSize.toFixed(2)}\n` +
+      `・ネオン太さ(px): ${neonPrimaryMat ? neonPrimaryMat.linewidth.toFixed(1) : "-"}\n` +
+      `・格子分割: ${roomType === "neon" ? neonGridDiv + "（内線3本、手前面なし）" : "-"}\n` +
+      `・ロック: ${locked ? "ON" : "OFF"}  score=${(lastScore ?? 0).toFixed(4)}\n` +
       `・顔サイズ: ${lockSize.toFixed(4)}  基準: ${baselineSize === null ? "未設定" : baselineSize.toFixed(4)}  ratio=${ratio.toFixed(3)}\n` +
-      `・FOV: ${smoothedFov.toFixed(1)}  露出: ${renderer.toneMappingExposure.toFixed(2)}\n` +
-      `・表示: ${isEmptyRoom ? "空っぽの部屋（市松）" : modelParam.split("/").slice(-1)[0]}\n` +
-      `・ライト: key=${spotKey.intensity.toFixed(0)} fill=${spotFill.intensity.toFixed(0)}（白飛びOK）`;
+      `・FOV: ${smoothedFov.toFixed(1)}\n` +
+      `・表示: ${isEmptyRoom ? "空っぽ（モデルなし）" : modelParam.split("/").slice(-1)[0]}`;
 
     renderer.render(scene, camera);
   }
 
-  // -----------------------------
-  // 起動
-  // -----------------------------
   (async function boot() {
     try {
       await loadModelIfNeeded();
       await startCamera();
 
-      // 初期値
       desiredCamPos.set(0, 0, 2.25);
       smoothedCamPos.copy(desiredCamPos);
       desiredFov = smoothedFov = baseFov;
@@ -581,6 +650,10 @@
 
       camera.position.copy(smoothedCamPos);
       camera.lookAt(target);
+
+      const w = wrap.clientWidth, h = wrap.clientHeight;
+      if (neonPrimaryMat) neonPrimaryMat.resolution.set(w, h);
+      if (neonHaloMat) neonHaloMat.resolution.set(w, h);
 
       await initFaceLandmarker();
       requestAnimationFrame(onFrame);
