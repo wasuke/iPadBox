@@ -21,6 +21,8 @@
     .warn { color:#ffcf7a; }
     .ok { color:#a7ffb3; }
     .small { font-size: 12px; opacity: .8; }
+    .toggle { display:flex; gap:10px; align-items:center; }
+    .toggle input { transform: scale(1.15); }
   </style>
 </head>
 <body>
@@ -53,23 +55,43 @@
   </section>
 
   <section class="card">
-    <strong>2) コンテンツ選択（3Dモデル）</strong>
-    <div class="row" style="margin-top:10px;">
-        <select id="modelSelect" style="flex:1; min-width: 220px;">
-        <option value="__EMPTY_ROOM__">空っぽの部屋（格子）</option>
-        <option value="assets/models/DamagedHelmet.glb">サンプル：Damaged Helmet（glb）</option>
-        <!-- ここにあなたの .glb を追加 -->
-        <option value="assets/models/kalestras_book.glb">サンプル：魔法使いの本（glb）</option>
-        <option value="assets/models/vitruvian.glb">サンプル：ダヴィンチの人体図（glb）</option>
+    <strong>2) 表示設定</strong>
+
+    <div style="margin-top:10px; display:grid; gap:12px;">
+      <div>
+        <div class="small" style="margin-bottom:6px;">部屋の種類：</div>
+        <select id="roomSelect" style="width:min(520px,100%);">
+          <option value="checker" selected>格子の部屋（市松＋明るいパッチ）</option>
+          <option value="neon">ネオン輪郭の部屋（真っ黒＋輪郭線のみ）</option>
         </select>
-    </div>
-    <div class="hint">
-      ・スミソニアンの3Dは 3d.si.edu（Open Access/CC0）や Sketchfab の Smithsonian アカウントから取得できます。 [oai_citation:2‡3D Digitization](https://3d.si.edu/?utm_source=chatgpt.com)
+        <div class="hint">・ホログラム用のミラー投影では「ネオン輪郭」が映えやすい想定です。</div>
+      </div>
+
+      <div class="toggle">
+        <input id="rotToggle" type="checkbox" checked />
+        <label for="rotToggle">オブジェクトを回転させる（GLB表示時）</label>
+      </div>
     </div>
   </section>
 
   <section class="card">
-    <strong>3) 起動</strong>
+    <strong>3) コンテンツ選択（3Dモデル）</strong>
+    <div class="row" style="margin-top:10px;">
+      <select id="modelSelect" style="flex:1; min-width: 220px;">
+        <option value="__EMPTY_ROOM__">空っぽの部屋（モデルなし）</option>
+        <option value="assets/models/DamagedHelmet.glb">サンプル：Damaged Helmet（glb）</option>
+        <!-- ここにあなたの .glb を追加 -->
+        <option value="assets/models/kalestras_book.glb">サンプル：魔法使いの本（glb）</option>
+        <option value="assets/models/vitruvian.glb">サンプル：ダヴィンチの人体図（glb）</option>
+      </select>
+    </div>
+    <div class="hint">
+      ・スミソニアンの3Dは 3d.si.edu（Open Access/CC0）や Sketchfab の Smithsonian アカウントから取得できます。
+    </div>
+  </section>
+
+  <section class="card">
+    <strong>4) 起動</strong>
     <div class="row" style="margin-top:10px;">
       <button id="btnStart" disabled>デモ開始（全画面）</button>
       <span class="small">※ iPadはユーザー操作がないと全画面にできないことがあります</span>
@@ -110,7 +132,6 @@
 
   btnPerm.addEventListener("click", async () => {
     try {
-      // まず許可を取る（ラベルが出るのは多くの場合ここから）
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
       stream.getTracks().forEach(t => t.stop());
       await refreshDevices();
@@ -126,10 +147,16 @@
     const deviceId = deviceSelect.value || "";
     const modelUrl = document.getElementById("modelSelect").value;
 
+    const roomType = document.getElementById("roomSelect").value; // checker | neon
+    const rotate = document.getElementById("rotToggle").checked ? "1" : "0";
+
     const sp = new URLSearchParams();
     sp.set("camMode", camMode);
     if (deviceId) sp.set("deviceId", deviceId);
     sp.set("model", modelUrl);
+
+    sp.set("room", roomType);
+    sp.set("rotate", rotate);
 
     location.href = `viewer.html?${sp.toString()}`;
   });
