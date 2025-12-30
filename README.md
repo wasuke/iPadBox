@@ -5,6 +5,8 @@
 iPad（Safari）を主な対象とし、カメラで取得した顔の位置に応じて、  
 箱の中を「覗き込んでいるように見える」視点移動を行います。
 
+コミケC107で配布した冊子→https://wasuke.github.io/iPadBox/c107FreePaper.pdf
+
 ---
 
 ## 重要な位置づけ
