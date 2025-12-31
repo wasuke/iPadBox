@@ -39,7 +39,7 @@ iPad（Safari）を主な対象とし、カメラで取得した顔の位置に�
 - macOS / Windows（Chrome, Safari）  
 - HTTPS 環境（GitHub Pages / Live Server など）
 
-※ カメラ使用のため **HTTPS または localhost** が必要かもしれません（多分、無くても大丈夫）。
+※ カメラ使用のため **HTTPS または localhost** が必要。
 
 ---
 
