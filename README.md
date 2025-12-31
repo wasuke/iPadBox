@@ -52,5 +52,3 @@ iPad（Safari）を主な対象とし、カメラで取得した顔の位置に�
 5. DemoPage→https://wasuke.github.io/iPadBox/
 
 GLBモデルを表示する場合は、URL パラメータで指定します。
-
-例：
