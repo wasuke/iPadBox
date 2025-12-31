@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>両手操作デモ（USBカメラ対応）</title>
+  <title>両手操作デモ（USBカメラ対応・Hand安定版）</title>
   <link rel="icon" href="data:,">
 
   <script type="importmap">
@@ -21,6 +21,7 @@
     canvas { display:block; width:100%; height:100%; }
 
     #video { position: fixed; right: 10px; bottom: 10px; width: 180px; height: 135px; opacity: 0; pointer-events:none; }
+    /* デバッグで映像を見たければ opacity を 0.35 などに */
 
     #hud {
       position: fixed; left: 12px; top: 12px; right: 12px;
@@ -36,14 +37,7 @@
       align-items: flex-start;
     }
 
-    #ctrl {
-      display:flex;
-      gap: 8px;
-      align-items: center;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-      max-width: 58vw;
-    }
+    #ctrl { display:flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; max-width: 60vw; }
 
     select, button {
       font-size: 14px;
@@ -54,7 +48,6 @@
       color: #fff;
     }
     select { background: rgba(20,60,120,.35); }
-    small { opacity: .85; }
   </style>
 </head>
 
@@ -87,8 +80,8 @@ btnFS.addEventListener("click", async () => {
 });
 
 // ===== 設定 =====
-const MODEL_URL = "./vitruvian.glb";   // 同階層に置く
-const HAND_NEAR_SIZE = 0.16;           // 反応しない→ 0.12〜0.15へ
+const MODEL_URL = "./vitruvian.glb";
+const HAND_NEAR_SIZE = 0.16;     // 「近い」判定。検出が0の問題には直接関係しない（検出が出てから効く）
 const MAX_YAW = Math.PI * 0.35;
 const MAX_PITCH = Math.PI * 0.20;
 const MAX_ROLL = Math.PI * 0.08;
@@ -106,11 +99,9 @@ scene.background = new THREE.Color(0x000000);
 const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100);
 camera.position.set(0, 0.1, 2.5);
 
-const clock = new THREE.Clock();
 const root = new THREE.Group();
 scene.add(root);
 
-// 光
 scene.add(new THREE.AmbientLight(0xffffff, 0.25));
 const key = new THREE.DirectionalLight(0xffffff, 2.6);
 key.position.set(1.2, 1.6, 1.8);
@@ -131,7 +122,6 @@ async function loadModel() {
     const box = new THREE.Box3().setFromObject(model);
     const size = new THREE.Vector3(); box.getSize(size);
     const center = new THREE.Vector3(); box.getCenter(center);
-
     model.position.sub(center);
 
     const maxDim = Math.max(size.x, size.y, size.z, 1e-6);
@@ -168,25 +158,50 @@ const { HandLandmarker, FilesetResolver } = await import(
 
 let handLandmarker = null;
 let stream = null;
+let usingDelegate = "GPU";
 
-async function initHandLandmarker() {
+async function initHandLandmarkerWithFallback() {
   const vision = await FilesetResolver.forVisionTasks(
     `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/wasm`
   );
+
+  // まずGPU、ダメならCPUにフォールバック
+  try {
+    usingDelegate = "GPU";
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      numHands: 2,
+      minHandDetectionConfidence: 0.3,
+      minHandPresenceConfidence: 0.3,
+      minTrackingConfidence: 0.3
+    });
+    return;
+  } catch (e) {
+    console.warn("GPU delegate failed, fallback to CPU", e);
+  }
+
+  usingDelegate = "CPU";
   handLandmarker = await HandLandmarker.createFromOptions(vision, {
     baseOptions: {
       modelAssetPath:
         "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-      delegate: "GPU"
+      delegate: "CPU"
     },
     runningMode: "VIDEO",
-    numHands: 2
+    numHands: 2,
+    minHandDetectionConfidence: 0.3,
+    minHandPresenceConfidence: 0.3,
+    minTrackingConfidence: 0.3
   });
 }
 
-// ★ カメラ許可 → デバイス一覧取得（USBカメラもここに出る）
+// ★ カメラ許可 → デバイス一覧取得
 async function primeAndListCameras() {
-  // まず最低限のgetUserMediaを呼ばないと、iPad Safariではラベルが空になりがち
   const tmp = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
   tmp.getTracks().forEach(t => t.stop());
 
@@ -197,7 +212,6 @@ async function primeAndListCameras() {
   cams.forEach((c, i) => {
     const opt = document.createElement("option");
     opt.value = c.deviceId;
-    // ラベルが取れないときは "Camera 1" みたいに出す
     opt.textContent = c.label || `Camera ${i+1}`;
     camSelect.appendChild(opt);
   });
@@ -212,7 +226,6 @@ async function primeAndListCameras() {
   }
 }
 
-// ★ 選択した camera(deviceId) で開始
 async function startSelectedCamera(deviceId) {
   if (stream) stream.getTracks().forEach(t => t.stop());
 
@@ -222,7 +235,14 @@ async function startSelectedCamera(deviceId) {
   };
   stream = await navigator.mediaDevices.getUserMedia(constraints);
   video.srcObject = stream;
+
+  // iOS対策：再生開始を明示
   await video.play();
+
+  // デバッグ：実際の解像度
+  const track = stream.getVideoTracks()[0];
+  const s = track?.getSettings?.() || {};
+  return s;
 }
 
 // ===== 手情報 =====
@@ -280,7 +300,8 @@ function computeTargetsFromHands(hands) {
 }
 
 // ===== ループ =====
-let lastVideoTime = -1;
+let lastFrameTs = 0;
+let lastHandsCount = 0;
 
 function resizeIfNeeded() {
   const w = wrap.clientWidth, h = wrap.clientHeight;
@@ -292,27 +313,38 @@ function resizeIfNeeded() {
   }
 }
 
-function animate() {
-  requestAnimationFrame(animate);
+// Safari/iOS向け：requestVideoFrameCallback が使えればそれで回す
+function onVideoFrame(now, metadata) {
+  tick(now);
+  if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onVideoFrame);
+}
+
+function rafLoop() {
+  tick(performance.now());
+  requestAnimationFrame(rafLoop);
+}
+
+function tick(now) {
   resizeIfNeeded();
-  clock.getDelta();
 
   let active = false;
   let nearCount = 0;
   let handSizes = [];
+  let handsCount = 0;
 
-  if (handLandmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
-    const now = performance.now();
+  if (handLandmarker && video.readyState >= 2) {
+    // requestVideoFrameCallback の場合でも detectForVideo に now を渡す
     const res = handLandmarker.detectForVideo(video, now);
-    lastVideoTime = video.currentTime;
-
     const lms = res.handLandmarks || [];
-    const hands = lms.map(bboxFromLandmarks);
+    handsCount = lms.length;
 
-    const r = computeTargetsFromHands(hands);
-    active = r.active;
-    nearCount = r.nearCount;
-    handSizes = r.handSizes;
+    if (handsCount > 0) {
+      const hands = lms.map(bboxFromLandmarks);
+      const r = computeTargetsFromHands(hands);
+      active = r.active;
+      nearCount = r.nearCount;
+      handSizes = r.handSizes;
+    }
   }
 
   // スムージング
@@ -322,7 +354,6 @@ function animate() {
 
   if (model) {
     if (!active) {
-      // 近い手が消えたら、ゆっくり中心へ戻す
       targetYaw *= 0.96;
       targetPitch *= 0.96;
       targetRoll *= 0.92;
@@ -330,13 +361,16 @@ function animate() {
     root.rotation.set(curPitch, curYaw, curRoll);
   }
 
+  lastHandsCount = handsCount;
+
   statusEl.textContent =
-    `両手操作デモ（USBカメラ対応）\n` +
+    `両手操作デモ（USBカメラ対応・Hand安定版）\n` +
     `選択カメラ: ${camSelect.selectedOptions[0]?.textContent ?? "-"}\n` +
-    `検出: ${handSizes.length}手 / 近い判定: ${nearCount}手（しきい値=${HAND_NEAR_SIZE}）\n` +
+    `Hand delegate: ${usingDelegate}\n` +
+    `検出: ${handsCount}手 / 近い判定: ${nearCount}手（しきい値=${HAND_NEAR_SIZE}）\n` +
     `手size: ${handSizes.length ? handSizes.map(s=>s.toFixed(3)).join(", ") : "-"}\n` +
     `角度: yaw=${curYaw.toFixed(2)} pitch=${curPitch.toFixed(2)} roll=${curRoll.toFixed(2)}\n` +
-    `ヒント: 反応しない→ HAND_NEAR_SIZE を 0.12〜0.15 に`;
+    `ヒント: 検出が0のまま→ USBカメラを別の候補に切替 / delegate=CPUで改善することが多い`;
 
   renderer.render(scene, camera);
 }
@@ -350,18 +384,26 @@ function animate() {
     statusEl.textContent = "カメラ許可→一覧取得中…（USBカメラも含まれます）";
     await primeAndListCameras();
 
-    statusEl.textContent = "「このカメラで開始」を押して開始してください。";
+    statusEl.textContent = "「このカメラで開始」を押してください。";
     btnApply.addEventListener("click", async () => {
       btnApply.disabled = true;
       try {
         statusEl.textContent = "カメラ開始中…";
-        await startSelectedCamera(camSelect.value);
+        const s = await startSelectedCamera(camSelect.value);
 
-        statusEl.textContent = "手認識初期化中…";
-        await initHandLandmarker();
+        statusEl.textContent =
+          `手認識初期化中…（GPU→CPUフォールバック）\n` +
+          `camera: ${s.width ?? "?"}x${s.height ?? "?"}  fps=${s.frameRate ?? "?"}`;
 
-        statusEl.textContent = "準備OK。手を近づけると角度が変わります。";
-        animate();
+        await initHandLandmarkerWithFallback();
+
+        statusEl.textContent =
+          `準備OK。手を近づけると角度が変わります。\n` +
+          `delegate=${usingDelegate}`;
+
+        if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onVideoFrame);
+        else requestAnimationFrame(rafLoop);
+
       } catch (e) {
         console.error(e);
         statusEl.textContent = "エラー：USBカメラ・許可・接続を確認してください。\n" + String(e);
