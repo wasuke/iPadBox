@@ -75,9 +75,11 @@
   import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 
   const MP_VER = "0.10.22-rc.20250304";
-  const { FaceLandmarker, FilesetResolver } = await import(
-    `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/vision_bundle.mjs`
-  );
+  const {
+    FaceLandmarker,
+    HandLandmarker,
+    FilesetResolver
+  } = await import(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/vision_bundle.mjs`);
 
   const wrap = document.getElementById("wrap");
   const statusEl = document.getElementById("status");
@@ -100,6 +102,9 @@
 
   function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 
+  // -----------------------------
+  // three.js
+  // -----------------------------
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -115,7 +120,7 @@
   const camera = new THREE.PerspectiveCamera(baseFov, 1, 0.01, 50);
 
   // 部屋（20%小さく）
-  const boxSize = 2.8 * 0.5;
+  const boxSize = 2.8 * 0.8;
   let roomGroup = null;
 
   let neonPrimaryMat = null;
@@ -186,7 +191,7 @@
     return tex;
   }
 
-  // ★ ネオン：外枠＋荒い格子（ただし「手前面の格子だけ無し」）
+  // ネオン：外枠＋荒い格子（ただし手前面の格子なし）
   function makeNeonEdgesGroup() {
     const g = new THREE.Group();
     const half = boxSize * 0.5;
@@ -194,7 +199,7 @@
     const positions = [];
     const pushSeg = (x1,y1,z1, x2,y2,z2) => positions.push(x1,y1,z1, x2,y2,z2);
 
-    // 1) 外枠（必ず残す）
+    // 外枠
     {
       const geo = new THREE.BoxGeometry(boxSize, boxSize, boxSize);
       const edges = new THREE.EdgesGeometry(geo);
@@ -202,38 +207,37 @@
       for (let i = 0; i < arr.length; i++) positions.push(arr[i]);
     }
 
-    // 2) 格子：各面に追加。ただし「手前面（Z=+側）」は追加しない
+    // 格子
     const step = (2 * half) / neonGridDiv;
 
-    // Z面：奥側のみ（Z=-half+eps）に格子を追加
-    // ※カメラは通常 +Z 側から見ているので、Z=+ は「手前」
+    // Z面：奥側のみ
     {
-      const z = -half + eps; // 奥
+      const z = -half + eps;
       for (let k = 1; k < neonGridDiv; k++) {
         const x = -half + step * k;
-        pushSeg(x, -half, z,  x,  half, z);     // 縦（Y方向）
+        pushSeg(x, -half, z,  x,  half, z);
         const y = -half + step * k;
-        pushSeg(-half, y, z,  half, y, z);      // 横（X方向）
+        pushSeg(-half, y, z,  half, y, z);
       }
     }
 
-    // X面：左右（両方）に格子
+    // X面：左右
     for (const x of [half - eps, -half + eps]) {
       for (let k = 1; k < neonGridDiv; k++) {
         const z = -half + step * k;
-        pushSeg(x, -half, z,  x,  half, z);     // 縦（Y方向）
+        pushSeg(x, -half, z,  x,  half, z);
         const y = -half + step * k;
-        pushSeg(x, y, -half,  x, y,  half);     // 横（Z方向）
+        pushSeg(x, y, -half,  x, y,  half);
       }
     }
 
-    // Y面：上下（両方）に格子
+    // Y面：上下
     for (const y of [half - eps, -half + eps]) {
       for (let k = 1; k < neonGridDiv; k++) {
         const x = -half + step * k;
-        pushSeg(x, y, -half,  x, y,  half);     // 縦（X方向）
+        pushSeg(x, y, -half,  x, y,  half);
         const z = -half + step * k;
-        pushSeg(-half, y, z,  half, y, z);      // 横（Z方向）
+        pushSeg(-half, y, z,  half, y, z);
       }
     }
 
@@ -294,12 +298,10 @@
     roomGroup = buildRoom(type);
     scene.add(roomGroup);
   }
-
   setRoom(roomType);
 
   // 光源
   scene.add(new THREE.AmbientLight(0xffffff, roomType === "neon" ? 0.10 : 0.18));
-
   const spotKey = new THREE.SpotLight(0xffffff, 140, 30, Math.PI / 7, 0.35, 1.4);
   spotKey.position.set(0.8, 1.6, 2.3);
   scene.add(spotKey);
@@ -314,7 +316,9 @@
 
   const target = new THREE.Vector3(0, 0, 0);
 
-  // カメラ制御
+  // -----------------------------
+  // 顔 → カメラ（既存）
+  // -----------------------------
   const virtualEye = new THREE.Vector3(0, 0, 3.2);
   const frontZ = (boxSize * 0.5) - 0.01;
 
@@ -322,7 +326,6 @@
   const planeHeight = 1.2;
 
   const baseT = 0.62;
-
   const smoothPos = 0.18;
   const smoothFov = 0.10;
 
@@ -354,10 +357,10 @@
     );
   }
 
-  function computeHeadFromLandmarks(landmarks) {
-    let sx = 0, sy = 0;
+  function computeBBoxFromLandmarks(landmarks) {
     let minX =  1e9, minY =  1e9;
     let maxX = -1e9, maxY = -1e9;
+    let sx = 0, sy = 0;
 
     const n = landmarks.length;
     for (let i = 0; i < n; i++) {
@@ -368,19 +371,16 @@
       if (p.x > maxX) maxX = p.x;
       if (p.y > maxY) maxY = p.y;
     }
-
     const cx = sx / n;
     const cy = sy / n;
-
     const w = (maxX - minX);
     const h = (maxY - minY);
     const size = Math.max(w, h);
-
-    return { center: { x: cx, y: cy }, size };
+    return { center: { x: cx, y: cy }, size, w, h };
   }
 
   function pickLockedFace(faceLandmarksList) {
-    const candidates = faceLandmarksList.map(lm => computeHeadFromLandmarks(lm));
+    const candidates = faceLandmarksList.map(lm => computeBBoxFromLandmarks(lm));
 
     if (!locked) {
       let best = candidates[0];
@@ -390,7 +390,6 @@
       lockCenter = { x: best.center.x, y: best.center.y };
       lockSize = best.size;
       lastGoodTime = performance.now();
-
       baselineSize = best.size;
 
       return { center: lockCenter, size: lockSize, score: 0 };
@@ -443,7 +442,9 @@
     desiredFov = baseFov - fovDelta;
   }
 
-  // GLB
+  // -----------------------------
+  // 3Dモデル
+  // -----------------------------
   const loader = new GLTFLoader();
   let modelRoot = null;
   let modelBaseY = 0.10;
@@ -498,6 +499,9 @@
     statusEl.textContent = `モデル表示中 / room=${roomType}`;
   }
 
+  // -----------------------------
+  // Webカメラ
+  // -----------------------------
   async function startCamera() {
     let constraints = { audio: false, video: {} };
 
@@ -514,11 +518,15 @@
     await video.play();
   }
 
+  // -----------------------------
+  // MediaPipe：顔＋手
+  // -----------------------------
   let faceLandmarker = null;
+  let handLandmarker = null;
   let lastVideoTime = -1;
 
-  async function initFaceLandmarker() {
-    statusEl.textContent += " / 顔トラッキング初期化…";
+  async function initLandmarkers() {
+    statusEl.textContent += " / MediaPipe初期化…";
 
     const vision = await FilesetResolver.forVisionTasks(
       `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/wasm`
@@ -535,9 +543,23 @@
       outputFaceBlendshapes: false
     });
 
-    statusEl.textContent = (isEmptyRoom ? `空っぽの部屋 / room=${roomType}` : `モデル表示中 / room=${roomType}`) + " / ロック追跡ON";
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      numHands: 2
+    });
+
+    statusEl.textContent =
+      (isEmptyRoom ? `空っぽの部屋 / room=${roomType}` : `モデル表示中 / room=${roomType}`) +
+      " / 顔ロック追跡ON / 手スワイプON";
   }
 
+  // -----------------------------
+  // ネオン線：距離で太さ変更
+  // -----------------------------
   function updateNeonLinewidth() {
     if (!neonPrimaryMat || !neonHaloMat) return;
     const d = camera.position.length();
@@ -547,9 +569,70 @@
     neonHaloMat.linewidth = halo;
   }
 
-  const rotSpeed = 0.25;
+  // -----------------------------
+  // 手スワイプ → 2秒スピン
+  // -----------------------------
+  // 近づけ判定（bbox size のしきい値）
+  const HAND_NEAR_SIZE = 0.22;     // 大きいほど「カメラに近い」扱い（環境で調整）
+  // スワイプ判定（右→左）
+  const SWIPE_WINDOW_MS = 260;     // この時間内で大きく動いたらスワイプ
+  const SWIPE_DX = 0.22;           // x がこれ以上減ったら（右→左）スワイプ
+  const SWIPE_MIN_SAMPLES = 3;
+
+  let spinUntil = 0;               // performance.now() のミリ秒
+  const SPIN_DURATION_MS = 2000;
+
+  // 手の横移動履歴（直近だけ保持）
+  const handTrace = []; // {t, x, size}
+
+  function pushHandSample(t, x, size) {
+    handTrace.push({ t, x, size });
+    const cutoff = t - 400; // 少し余裕
+    while (handTrace.length && handTrace[0].t < cutoff) handTrace.shift();
+  }
+
+  function detectRightToLeftSwipe(now) {
+    if (handTrace.length < SWIPE_MIN_SAMPLES) return false;
+
+    // 近いサンプルだけで見る
+    const near = handTrace.filter(s => s.size >= HAND_NEAR_SIZE);
+    if (near.length < SWIPE_MIN_SAMPLES) return false;
+
+    const t0 = near[0].t;
+    const t1 = near[near.length - 1].t;
+    if (t1 - t0 > SWIPE_WINDOW_MS) {
+      // 窓が広すぎたら、末尾側だけで再評価（簡易）
+      const cutoff = now - SWIPE_WINDOW_MS;
+      const sliced = near.filter(s => s.t >= cutoff);
+      if (sliced.length < SWIPE_MIN_SAMPLES) return false;
+      const dx2 = sliced[sliced.length - 1].x - sliced[0].x;
+      return dx2 <= -SWIPE_DX;
+    }
+
+    const dx = near[near.length - 1].x - near[0].x;
+    return dx <= -SWIPE_DX;
+  }
+
+  function chooseMainHand(handLandmarksList) {
+    // いちばん大きい手（bbox size 最大）を採用
+    let best = null;
+    let bestSize = -1;
+    for (const lm of handLandmarksList) {
+      const bb = computeBBoxFromLandmarks(lm);
+      if (bb.size > bestSize) { bestSize = bb.size; best = bb; }
+    }
+    return best; // {center,size,...}
+  }
+
+  // -----------------------------
+  // アニメーション
+  // -----------------------------
+  const baseRotSpeed = 0.25;     // 通常ゆっくり
+  const spinRotSpeed = 8.0;      // スワイプ後 2秒間 速い
+
   let lastT = performance.now();
   let lastScore = 0;
+  let handNearNow = false;
 
   function onFrame(now = performance.now()) {
     requestAnimationFrame(onFrame);
@@ -567,50 +650,73 @@
       renderer.setSize(w, h, false);
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
-
       if (neonPrimaryMat) neonPrimaryMat.resolution.set(w, h);
       if (neonHaloMat) neonHaloMat.resolution.set(w, h);
     }
 
-    if (modelRoot && rotateEnabled) {
-      modelRoot.rotation.y += rotSpeed * dt;
+    // モデル回転：通常（設定）＋ スワイプで一時スピン
+    if (modelRoot) {
+      const spinning = now < spinUntil;
+      const spd = spinning ? spinRotSpeed : (rotateEnabled ? baseRotSpeed : 0);
+      modelRoot.rotation.y += spd * dt;
     }
 
     const focusY = modelRoot ? modelBaseY : 0.08;
     spotKey.target.position.set(0, focusY, 0);
     spotFill.target.position.set(0, focusY, 0);
 
-    if (faceLandmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    // 顔＋手（同一フレームで解析）
+    if ((faceLandmarker || handLandmarker) && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
       const ts = performance.now();
-      const res = faceLandmarker.detectForVideo(video, ts);
-      lastVideoTime = video.currentTime;
 
-      const faces = res.faceLandmarks;
+      // 顔
+      if (faceLandmarker) {
+        const resF = faceLandmarker.detectForVideo(video, ts);
+        const faces = resF.faceLandmarks;
 
-      if (faces && faces.length > 0) {
-        const picked = pickLockedFace(faces);
-
-        if (picked) {
-          lastScore = picked.score;
-          applyLineOfSightCamera(picked.center, picked.size);
-        } else {
-          if (now - lastGoodTime < LOST_HOLD_MS) {
-            applyLineOfSightCamera(lockCenter, lockSize);
+        if (faces && faces.length > 0) {
+          const picked = pickLockedFace(faces);
+          if (picked) {
+            lastScore = picked.score;
+            applyLineOfSightCamera(picked.center, picked.size);
           } else {
-            locked = false;
-            baselineSize = null;
+            if (now - lastGoodTime < LOST_HOLD_MS) applyLineOfSightCamera(lockCenter, lockSize);
+            else { locked = false; baselineSize = null; }
           }
-        }
-      } else {
-        if (locked && (now - lastGoodTime < LOST_HOLD_MS)) {
-          applyLineOfSightCamera(lockCenter, lockSize);
         } else {
-          locked = false;
-          baselineSize = null;
+          if (locked && (now - lastGoodTime < LOST_HOLD_MS)) applyLineOfSightCamera(lockCenter, lockSize);
+          else { locked = false; baselineSize = null; }
         }
       }
+
+      // 手
+      handNearNow = false;
+      if (handLandmarker) {
+        const resH = handLandmarker.detectForVideo(video, ts);
+        const hands = resH.handLandmarks;
+
+        if (hands && hands.length > 0) {
+          const main = chooseMainHand(hands);
+          if (main) {
+            pushHandSample(now, main.center.x, main.size);
+            handNearNow = main.size >= HAND_NEAR_SIZE;
+
+            // 連続トリガー防止：スピン中は判定しない
+            if (now >= spinUntil) {
+              if (detectRightToLeftSwipe(now)) {
+                spinUntil = now + SPIN_DURATION_MS;
+                // トリガー後は履歴を軽くリセット（誤連発防止）
+                handTrace.length = 0;
+              }
+            }
+          }
+        }
+      }
+
+      lastVideoTime = video.currentTime;
     }
 
+    // カメラスムージング
     smoothedCamPos.lerp(desiredCamPos, smoothPos);
     camera.position.copy(smoothedCamPos);
     camera.lookAt(target);
@@ -622,13 +728,15 @@
     updateNeonLinewidth();
 
     const ratio = (baselineSize === null) ? 1 : (lockSize / baselineSize);
+    const spinning = now < spinUntil;
+
     msgEl.textContent =
       `・room: ${roomType}（neon は手前面格子なし）\n` +
-      `・回転: ${rotateEnabled ? "ON" : "OFF"}\n` +
+      `・回転: ${rotateEnabled ? "ON" : "OFF"} / スワイプスピン: ${spinning ? "ON" : "OFF"}\n` +
+      `・手が近い: ${handNearNow ? "YES" : "no"} / しきい値(size): ${HAND_NEAR_SIZE}\n` +
       `・部屋サイズ: ${boxSize.toFixed(2)}\n` +
       `・ネオン太さ(px): ${neonPrimaryMat ? neonPrimaryMat.linewidth.toFixed(1) : "-"}\n` +
-      `・格子分割: ${roomType === "neon" ? neonGridDiv + "（内線3本、手前面なし）" : "-"}\n` +
-      `・ロック: ${locked ? "ON" : "OFF"}  score=${(lastScore ?? 0).toFixed(4)}\n` +
+      `・顔ロック: ${locked ? "ON" : "OFF"}  score=${(lastScore ?? 0).toFixed(4)}\n` +
       `・顔サイズ: ${lockSize.toFixed(4)}  基準: ${baselineSize === null ? "未設定" : baselineSize.toFixed(4)}  ratio=${ratio.toFixed(3)}\n` +
       `・FOV: ${smoothedFov.toFixed(1)}\n` +
       `・表示: ${isEmptyRoom ? "空っぽ（モデルなし）" : modelParam.split("/").slice(-1)[0]}`;
@@ -636,6 +744,9 @@
     renderer.render(scene, camera);
   }
 
+  // -----------------------------
+  // 起動
+  // -----------------------------
   (async function boot() {
     try {
       await loadModelIfNeeded();
@@ -655,11 +766,11 @@
       if (neonPrimaryMat) neonPrimaryMat.resolution.set(w, h);
       if (neonHaloMat) neonHaloMat.resolution.set(w, h);
 
-      await initFaceLandmarker();
+      await initLandmarkers();
       requestAnimationFrame(onFrame);
     } catch (e) {
       console.error(e);
-      statusEl.textContent = "エラー（カメラ許可・CDN・モデル・顔追跡）";
+      statusEl.textContent = "エラー（カメラ許可・CDN・モデル・MediaPipe）";
       msgEl.textContent = String(e);
     }
   })();
